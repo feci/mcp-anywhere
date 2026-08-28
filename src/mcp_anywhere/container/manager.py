@@ -148,6 +148,34 @@ class ContainerManager:
         """Generate the container name for a server."""
         return f"mcp-{server_id}"
 
+    def _image_exists(self, server: MCPServer) -> bool:
+        """Whether this server's image is already built and present locally.
+
+        Startup asks two different questions and they must not be confused. Whether a
+        *container* is running decides how the proxy attaches (docker exec into it, or a
+        fresh docker run). Whether the *image* exists decides whether we have to pay for a
+        build. A host reboot stops every sibling container but leaves all their images on
+        disk, so keying the build on container liveness rebuilds images that are already
+        there -- on this estate that was 31 images and roughly nine minutes of downtime,
+        every reboot.
+
+        It is also a correctness point, not only speed: a rebuild re-runs the install step,
+        so a start command whose version is not pinned silently picks up whatever upstream
+        published in the meantime. Reusing the built image keeps a restart deterministic.
+
+        Explicit rebuilds are unaffected -- creating or editing a server calls
+        build_server_image directly from the web routes.
+        """
+        try:
+            self.docker_client.images.get(self.get_image_tag(server))
+            return True
+        except ImageNotFound:
+            return False
+        except (APIError, OSError) as e:
+            # Cannot tell -- fall back to rebuilding, which is always safe.
+            logger.debug(f"Image existence check failed for {server.name}: {e}")
+            return False
+
     def _is_container_healthy(self, server: MCPServer) -> bool:
         """Check if existing container is healthy and can be reused.
 
@@ -646,7 +674,18 @@ class ContainerManager:
                             await session.commit()
                             continue
 
-                        # Container needs to be rebuilt
+                        # Container is gone, but its image may still be here (the
+                        # usual case after a host reboot). Reuse it instead of paying
+                        # for a rebuild; the proxy will start a fresh container from it.
+                        if self._image_exists(server):
+                            logger.info(f"Reusing existing image for {server.name}")
+                            server.build_status = "built"
+                            server.image_tag = self.get_image_tag(server)
+                            server.build_logs = "Reused existing image (not rebuilt)"
+                            await session.commit()
+                            continue
+
+                        # No image either -- build it.
                         logger.info(f"Building image for {server.name}...")
                         server.build_status = "building"
                         server.build_logs = "Building..."

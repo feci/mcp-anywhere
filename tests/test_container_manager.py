@@ -359,6 +359,40 @@ class TestCommandParsing:
         assert len(parsed) > 0
 
 
+class TestImageExistsReuse:
+    """_image_exists decides whether a rebuild is needed after the container is gone.
+
+    A host reboot stops every sibling container but leaves its image on disk. Keying the
+    build on container liveness alone rebuilds images that are already present, which on a
+    31-server gateway cost roughly nine minutes of downtime per reboot and re-ran every
+    install step.
+    """
+
+    def test_returns_true_when_image_present(self, container_manager, mock_docker_client):
+        server = MagicMock()
+        server.id = "abc12345"
+        mock_docker_client.images.get.return_value = MagicMock()
+
+        assert container_manager._image_exists(server) is True
+        mock_docker_client.images.get.assert_called_once_with("mcp-anywhere/server-abc12345")
+
+    def test_returns_false_when_image_missing(self, container_manager, mock_docker_client):
+        server = MagicMock()
+        server.id = "abc12345"
+        mock_docker_client.images.get.side_effect = ImageNotFound("Not found")
+
+        assert container_manager._image_exists(server) is False
+
+    def test_falls_back_to_rebuild_when_docker_errors(self, container_manager, mock_docker_client):
+        """An unreadable daemon must not be mistaken for a usable image."""
+        server = MagicMock()
+        server.id = "abc12345"
+        server.name = "broken"
+        mock_docker_client.images.get.side_effect = APIError("daemon unreachable")
+
+        assert container_manager._image_exists(server) is False
+
+
 class TestImageManagement:
 
     def test_ensure_image_exists_already_present(self, container_manager, mock_docker_client):
